@@ -7,6 +7,8 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import codecs
 from tkinter.scrolledtext import ScrolledText
 import threading
+import queue
+import traceback
 from typing import List, Tuple, Dict, Optional
 
 
@@ -37,6 +39,7 @@ PROMPT_NO_FILES_FOUND = "未找到符合条件的文件"
 PROMPT_NO_RULES = "请先添加替换规则"
 PROMPT_INVALID_FOLDER = "请选择有效的文件夹"
 PROMPT_ENTER_FILTER = "请输入筛选条件"
+PROMPT_ENTER_FIND = "请输入查找内容"
 PROMPT_CONFIRM_REPLACE = "确定要执行替换操作吗？这可能会修改多个文件的内容。"
 PROMPT_WARNING = "警告"
 PROMPT_INFO = "提示"
@@ -69,6 +72,8 @@ MSG_TOTAL_MATCHES = "找到匹配: {} 处"
 MSG_FAILED_FILES = "失败: {} 个文件"
 MSG_ABORTING_OPERATION = "正在终止操作..."
 MSG_START_PROCESS = "开始处理..."
+MSG_INVALID_REGEX = "规则正则表达式无效: {}"
+MSG_INVALID_RULES_FORMAT = "规则文件格式无效: {}"
 
 # TreeView列
 ALIAS_COL_NAME = "规则别名"
@@ -182,7 +187,16 @@ class RuleDialog(tk.Toplevel):
         if not (alias := self.alias_var.get().strip()):
             messagebox.showwarning(PROMPT_WARNING, PROMPT_ENTER_ALIAS)
             return
-            
+        if not self.find_var.get():
+            messagebox.showwarning(PROMPT_WARNING, PROMPT_ENTER_FIND)
+            return
+        if self.use_regex.get():
+            try:
+                re.compile(self.find_var.get())
+            except re.error as e:
+                messagebox.showerror(PROMPT_ERROR, MSG_INVALID_REGEX.format(e))
+                return
+
         self.result = {
             "alias": alias,
             "find": self.find_var.get(),
@@ -231,8 +245,59 @@ class BatchTextReplacer:
         self.create_widgets()
         self.running = False
 
+        # 跨线程 UI 更新队列：工作线程只入队，主线程统一执行
+        self._track_var(self.simple_mode, "_simple_mode")
+        self._track_var(self.read_encoding, "_read_encoding")
+        self._track_var(self.write_encoding, "_write_encoding")
+        self._ui_queue = queue.Queue()
+        self.root.after(100, self._process_ui_queue)
+
     def font_config(self):
         self.root.option_add("*Font", DEFAULT_FONT)
+
+    def _track_var(self, var, attr):
+        """同步 Tk 变量到普通属性，避免工作线程直接读取 Tk 变量"""
+        setattr(self, attr, var.get())
+        var.trace_add("write", lambda *_, v=var, a=attr: setattr(self, a, v.get()))
+
+    def _schedule_ui(self, callback, *args):
+        """把 UI 操作放入队列，由主线程执行"""
+        self._ui_queue.put((callback, args))
+
+    def _process_ui_queue(self):
+        while True:
+            try:
+                callback, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(*args)
+            except Exception:
+                traceback.print_exc()
+        self.root.after(100, self._process_ui_queue)
+
+    def _append_message(self, message):
+        self.message_text.config(state=tk.NORMAL)
+        self.message_text.insert(tk.END, message + "\n")
+        self.message_text.see(tk.END)
+        self.message_text.config(state=tk.DISABLED)
+
+    def _set_status(self, text):
+        self.status_var.set(text)
+
+    def _set_busy(self, busy):
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.find_only_btn.config(state=state)
+        self.replace_btn.config(state=state)
+        self.stop_btn.config(state=tk.NORMAL if busy else tk.DISABLED)
+        for btn in self.rule_buttons + self.rule_io_buttons:
+            btn.config(state=state)
+        self.read_encoding_combo.config(state="disabled" if busy else "readonly")
+        self.write_encoding_combo.config(state="disabled" if busy else "readonly")
+
+    def _reset_ui(self):
+        self.status_var.set(STATUS_READY)
+        self._set_busy(False)
 
     def _grid_widget(self, widget, row, col, **kwargs):
         """统一处理grid布局参数"""
@@ -290,19 +355,21 @@ class BatchTextReplacer:
         ttk.Label(encoding_frame, text=LABEL_READ_ENCODING).grid(
             row=0, column=0, sticky=tk.W, pady=WIDGET_PADY, padx=WIDGET_PADX)
         self.read_encoding = tk.StringVar(value="自动检测")
-        ttk.Combobox(
-            encoding_frame, textvariable=self.read_encoding, 
+        self.read_encoding_combo = ttk.Combobox(
+            encoding_frame, textvariable=self.read_encoding,
             values=self.supported_encodings, state="readonly", width=25
-        ).grid(row=0, column=1, sticky=tk.W, pady=WIDGET_PADY, padx=WIDGET_PADX)
-        
+        )
+        self.read_encoding_combo.grid(row=0, column=1, sticky=tk.W, pady=WIDGET_PADY, padx=WIDGET_PADX)
+
         ttk.Label(encoding_frame, text=LABEL_WRITE_ENCODING).grid(
             row=0, column=2, sticky=tk.W, pady=WIDGET_PADY, padx=WIDGET_PADX)
         self.write_encoding = tk.StringVar(value="保持原有编码")
-        ttk.Combobox(
+        self.write_encoding_combo = ttk.Combobox(
             encoding_frame, textvariable=self.write_encoding,
             values=["保持原有编码"] + self.supported_encodings[1:],
             state="readonly", width=25
-        ).grid(row=0, column=3, sticky=tk.W, pady=WIDGET_PADY, padx=WIDGET_PADX)
+        )
+        self.write_encoding_combo.grid(row=0, column=3, sticky=tk.W, pady=WIDGET_PADY, padx=WIDGET_PADX)
         encoding_frame.columnconfigure(4, weight=1)
 
     def create_rules_frame(self, parent):
@@ -348,16 +415,22 @@ class BatchTextReplacer:
         rules_btn_frame = ttk.Frame(rules_frame)
         rules_btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=WIDGET_PADY)
         
-        for btn_text, cmd in [(BTN_ADD_RULE, self.add_rule), 
+        self.rule_buttons = []
+        for btn_text, cmd in [(BTN_ADD_RULE, self.add_rule),
                              (BTN_EDIT_RULE, self.edit_rule), 
                              (BTN_DELETE_RULE, self.delete_rule)]:
-            ttk.Button(rules_btn_frame, text=btn_text, command=cmd).pack(side=tk.LEFT, padx=WIDGET_PADX)
+            btn = ttk.Button(rules_btn_frame, text=btn_text, command=cmd)
+            btn.pack(side=tk.LEFT, padx=WIDGET_PADX)
+            self.rule_buttons.append(btn)
         
         rule_io_frame = ttk.Frame(rules_frame)
         rule_io_frame.grid(row=2, column=0, sticky=tk.EW, pady=WIDGET_PADY)
         
+        self.rule_io_buttons = []
         for btn_text, cmd in [(BTN_SAVE_RULES, self.save_rules), (BTN_LOAD_RULES, self.load_rules)]:
-            ttk.Button(rule_io_frame, text=btn_text, command=cmd).pack(side=tk.LEFT, padx=WIDGET_PADX)
+            btn = ttk.Button(rule_io_frame, text=btn_text, command=cmd)
+            btn.pack(side=tk.LEFT, padx=WIDGET_PADX)
+            self.rule_io_buttons.append(btn)
 
     def create_message_frame(self, parent):
         message_frame = ttk.LabelFrame(parent, text=LABEL_OPERATION_MESSAGES, padding=FRAME_PADDING)
@@ -399,10 +472,18 @@ class BatchTextReplacer:
             self.folder_path.set(folder)
 
     def add_rule(self):
-        if (dialog := RuleDialog(self.root, DLG_TITLE_ADD_RULE)).result:
-            self.replace_rules.append(dialog.result)
-            self.update_rules_tree()
-            self._compile_rules()
+        result = RuleDialog(self.root, DLG_TITLE_ADD_RULE).result
+        if not result:
+            return
+        if result["use_regex"]:
+            try:
+                re.compile(result["find"])
+            except re.error as e:
+                messagebox.showerror(PROMPT_ERROR, MSG_INVALID_REGEX.format(e))
+                return
+        self.replace_rules.append(result)
+        self.update_rules_tree()
+        self._compile_rules()
 
     def edit_rule(self):
         if not (selected := self.rules_tree.selection()):
@@ -441,8 +522,12 @@ class BatchTextReplacer:
         """预编译所有规则的正则表达式，提升匹配效率"""
         self.compiled_rules = []
         for rule in self.replace_rules:
-            pattern = re.compile(rule["find"]) if rule.get("use_regex", False) else re.compile(re.escape(rule["find"]))
-            self.compiled_rules.append((pattern, rule["replace"]))
+            use_regex = rule.get("use_regex", False)
+            try:
+                pattern = re.compile(rule["find"]) if use_regex else re.compile(re.escape(rule["find"]))
+            except re.error as e:
+                raise re.error(f"{rule.get('alias', '')}: {e}") from e
+            self.compiled_rules.append((pattern, rule["replace"], use_regex))
 
     def save_rules(self):
         if not self.replace_rules:
@@ -458,30 +543,58 @@ class BatchTextReplacer:
                 self.add_message(MSG_RULES_SAVED.format(file_path))
             except IOError as e:
                 self.add_message(MSG_SAVE_RULES_FAILED_IO.format(str(e)))
-            except json.JSONDecodeError as e:
+            except (TypeError, ValueError) as e:
                 self.add_message(MSG_SAVE_RULES_FAILED_JSON.format(str(e)))
 
     def load_rules(self):
-        if file_path := filedialog.askopenfilename(filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")]):
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    self.replace_rules = json.load(f)
-                self.update_rules_tree()
-                self._compile_rules()
-                self.add_message(MSG_RULES_LOADED.format(file_path))
-            except IOError as e:
-                self.add_message(MSG_LOAD_RULES_FAILED_IO.format(str(e)))
-            except json.JSONDecodeError as e:
-                self.add_message(MSG_LOAD_RULES_FAILED_JSON.format(str(e)))
+        if not (file_path := filedialog.askopenfilename(
+                filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")])):
+            return
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (IOError, OSError, UnicodeDecodeError) as e:
+            self.add_message(MSG_LOAD_RULES_FAILED_IO.format(str(e)))
+            return
+        except json.JSONDecodeError as e:
+            self.add_message(MSG_LOAD_RULES_FAILED_JSON.format(str(e)))
+            return
+
+        if not isinstance(data, list):
+            self.add_message(MSG_INVALID_RULES_FORMAT.format("规则文件必须是一个数组"))
+            return
+
+        validated_rules = []
+        for index, rule in enumerate(data):
+            if (not isinstance(rule, dict) or "find" not in rule or "replace" not in rule
+                    or not isinstance(rule["find"], str) or not isinstance(rule["replace"], str)):
+                self.add_message(MSG_INVALID_RULES_FORMAT.format(f"第 {index + 1} 条规则缺少 find/replace 字段"))
+                return
+            if not rule["find"]:
+                self.add_message(MSG_INVALID_RULES_FORMAT.format(f"第 {index + 1} 条规则的查找内容为空"))
+                return
+            if rule.get("use_regex", False):
+                try:
+                    re.compile(rule["find"])
+                except re.error as e:
+                    self.add_message(MSG_INVALID_REGEX.format(e))
+                    return
+            validated_rules.append({
+                "alias": str(rule.get("alias", f"规则{index + 1}")),
+                "find": rule["find"],
+                "replace": rule["replace"],
+                "use_regex": bool(rule.get("use_regex", False))
+            })
+
+        self.replace_rules = validated_rules
+        self.update_rules_tree()
+        self._compile_rules()
+        self.add_message(MSG_RULES_LOADED.format(file_path))
 
     def add_message(self, message, force=False):
-        if self.simple_mode.get() and not force:
+        if self._simple_mode and not force:
             return
-            
-        self.message_text.config(state=tk.NORMAL)
-        self.message_text.insert(tk.END, message + "\n")
-        self.message_text.see(tk.END)
-        self.message_text.config(state=tk.DISABLED)
+        self._schedule_ui(self._append_message, message)
 
     def clear_messages(self):
         self.message_text.config(state=tk.NORMAL)
@@ -500,14 +613,14 @@ class BatchTextReplacer:
         return "utf-8"  # 默认编码
 
     def _get_read_encoding(self, file_path) -> str:
-        if self.read_encoding.get() == "自动检测":
+        if self._read_encoding == "自动检测":
             encoding = self.detect_encoding(file_path)
             self.add_message(MSG_ENCODING_DETECTED.format(file_path, encoding))
             return encoding
-        return self.read_encoding.get()
+        return self._read_encoding
 
     def _get_write_encoding(self, original_encoding) -> str:
-        return self.write_encoding.get() if self.write_encoding.get() != "保持原有编码" else original_encoding
+        return self._write_encoding if self._write_encoding != "保持原有编码" else original_encoding
 
     def read_file_with_encoding(self, file_path):
         try:
@@ -520,45 +633,40 @@ class BatchTextReplacer:
             raise Exception(f"读取文件失败（编码错误）: {str(e)}")
 
     def write_file_with_encoding(self, file_path, content, original_encoding):
+        encoding = self._get_write_encoding(original_encoding)
+        # 先编码再写文件：编码失败时不会先把原文件截断
         try:
-            with codecs.open(file_path, 'w', encoding=self._get_write_encoding(original_encoding)) as f:
-                f.write(content)
+            encoded = content.encode(encoding)
+        except UnicodeEncodeError as e:
+            raise Exception(f"写入文件失败（编码错误）: {str(e)}")
+        except LookupError as e:
+            raise Exception(f"写入文件失败（未知编码）: {str(e)}")
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(encoded)
             return True
         except IOError as e:
             raise Exception(f"写入文件失败（I/O错误）: {str(e)}")
-        except UnicodeEncodeError as e:
-            raise Exception(f"写入文件失败（编码错误）: {str(e)}")
 
-    def find_files(self):
-        folder = self.folder_path.get()
-        pattern = self.file_filter_pattern.get()
-        
-        if not folder or not os.path.isdir(folder):
-            messagebox.showerror(PROMPT_ERROR, PROMPT_INVALID_FOLDER)
-            return []
-            
-        if not pattern:
-            messagebox.showerror(PROMPT_ERROR, PROMPT_ENTER_FILTER)
-            return []
-            
+    def _enumerate_files(self, folder, pattern, recursive):
         files = []
-        if self.recursive_var.get():
+        if recursive:
             for root_dir, _, _ in os.walk(folder):
                 files.extend(glob.glob(os.path.join(root_dir, pattern)))
         else:
             files = glob.glob(os.path.join(folder, pattern))
-        
-        self.add_message(MSG_TOTAL_FILES_FOUND.format(len(files)), force=True)
         return files
 
     def _process_content(self, content: str, replace_mode: bool) -> Tuple[str, int, bool]:
         modified, total_matches, current_content = False, 0, content
         
-        for pattern, replace_str in self.compiled_rules:
+        for pattern, replace_str, use_regex in self.compiled_rules:
             if (matches := len(pattern.findall(current_content))) > 0:
                 total_matches += matches
                 if replace_mode:
-                    new_content = pattern.sub(replace_str, current_content)
+                    # 非正则模式下的替换内容按字面处理，避免反斜杠被当作转义序列
+                    replacement = replace_str if use_regex else (lambda m: replace_str)
+                    new_content = pattern.sub(replacement, current_content)
                     if new_content != current_content:
                         current_content, modified = new_content, True
         
@@ -569,7 +677,7 @@ class BatchTextReplacer:
             content, original_encoding = self.read_file_with_encoding(file_path)
             new_content, matches, modified = self._process_content(content, replace_mode)
             
-            if not self.simple_mode.get():
+            if not self._simple_mode:
                 if matches > 0:
                     self.add_message(MSG_FILE_MATCHES_FOUND.format(file_path, matches))
                     if replace_mode and modified:
@@ -580,77 +688,93 @@ class BatchTextReplacer:
             if replace_mode and modified:
                 self.write_file_with_encoding(file_path, new_content, original_encoding)
                 
-            return (True, matches, None)
+            return (True, matches, modified, None)
         except Exception as e:
             error_msg = MSG_FILE_PROCESS_ERROR.format(file_path, str(e))
             self.add_message(error_msg, force=True)
-            return (False, 0, error_msg)
+            return (False, 0, False, error_msg)
 
-    def process_files(self, replace_mode=True):
-        if not self.replace_rules:
-            messagebox.showinfo(PROMPT_INFO, PROMPT_NO_RULES)
-            self.status_var.set(STATUS_READY)
-            self.find_only_btn.config(state=tk.NORMAL)
-            self.replace_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
-            return
-            
-        if not (files := self.find_files()):
-            self.add_message(PROMPT_NO_FILES_FOUND, force=True)
-            self.status_var.set(STATUS_READY)
-            self.find_only_btn.config(state=tk.NORMAL)
-            self.replace_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
-            return
-        
-        if self.simple_mode.get():
-            self.add_message(MSG_START_PROCESSING, force=True)
-        
-        total_files, processed, processed_successfully = len(files), 0, 0
+    def process_files(self, folder, pattern, recursive, replace_mode):
+        total_files, processed, processed_successfully = 0, 0, 0
         total_matches, replaced_files, failed_files = 0, 0, []
-        
-        for file_path in files:
-            if not self.running:
-                self.add_message(MSG_OPERATION_ABORTED, force=True)
-                break
-                
-            processed += 1
-            self.status_var.set(STATUS_PROCESSING.format(processed, total_files))
-            
-            success, matches, error = self.process_file(file_path, replace_mode)
-            total_matches += matches
-            
-            if success:
-                processed_successfully += 1
-                if replace_mode and matches > 0:
-                    replaced_files += 1
-            else:
-                failed_files.append((file_path, error))
-        
+        aborted = False
+
+        try:
+            if not folder or not os.path.isdir(folder):
+                self._schedule_ui(messagebox.showerror, PROMPT_ERROR, PROMPT_INVALID_FOLDER)
+                return
+
+            if not pattern:
+                self._schedule_ui(messagebox.showerror, PROMPT_ERROR, PROMPT_ENTER_FILTER)
+                return
+
+            try:
+                files = self._enumerate_files(folder, pattern, recursive)
+            except Exception as e:
+                self._schedule_ui(messagebox.showerror, PROMPT_ERROR,
+                                  MSG_FILE_PROCESS_ERROR.format(folder, str(e)))
+                return
+
+            total_files = len(files)
+            self.add_message(MSG_TOTAL_FILES_FOUND.format(total_files), force=True)
+
+            if total_files == 0:
+                self._schedule_ui(messagebox.showinfo, PROMPT_INFO, PROMPT_NO_FILES_FOUND)
+                return
+
+            if self._simple_mode:
+                self.add_message(MSG_START_PROCESSING, force=True)
+
+            for file_path in files:
+                if not self.running:
+                    aborted = True
+                    self.add_message(MSG_OPERATION_ABORTED, force=True)
+                    break
+
+                processed += 1
+                self._schedule_ui(self._set_status, STATUS_PROCESSING.format(processed, total_files))
+
+                success, matches, modified, error = self.process_file(file_path, replace_mode)
+                total_matches += matches
+
+                if success:
+                    processed_successfully += 1
+                    if replace_mode and modified:
+                        replaced_files += 1
+                else:
+                    failed_files.append((file_path, error))
+        finally:
+            self.running = False
+            self._schedule_ui(self._finish_processing, replace_mode, processed, total_files,
+                              processed_successfully, replaced_files, total_matches,
+                              failed_files, aborted)
+
+    def _finish_processing(self, replace_mode, processed, total_files, processed_successfully,
+                           replaced_files, total_matches, failed_files, aborted):
+        if total_files == 0:
+            self._reset_ui()
+            return
+
         self.add_message(MSG_PROCESSING_SUMMARY, force=True)
-        if self.running:
-            self.add_message(MSG_REPLACE_COMPLETE.format(processed) if replace_mode else MSG_FIND_COMPLETE.format(processed), force=True)
-            if replace_mode:
-                self.add_message(MSG_REPLACED_FILES.format(replaced_files), force=True)
-        else:
+        if aborted:
             self.add_message(MSG_OPERATION_TERMINATED.format(processed, total_files), force=True)
             if replace_mode:
                 self.add_message(MSG_ALREADY_REPLACED_FILES.format(replaced_files), force=True)
-        
+        else:
+            self.add_message(MSG_REPLACE_COMPLETE.format(processed) if replace_mode else MSG_FIND_COMPLETE.format(processed), force=True)
+            if replace_mode:
+                self.add_message(MSG_REPLACED_FILES.format(replaced_files), force=True)
+
         self.add_message(MSG_SUCCESSFUL_FILES.format(processed_successfully), force=True)
         self.add_message(MSG_TOTAL_MATCHES.format(total_matches), force=True)
-        
+
         if failed_files:
             self.add_message(MSG_FAILED_FILES.format(len(failed_files)), force=True)
-            if not self.simple_mode.get():
+            if not self._simple_mode:
                 for file, error in failed_files:
                     self.add_message(f"  - {file}: {error}", force=True)
-        
-        self.running = False
-        self.status_var.set(STATUS_READY)
-        self.find_only_btn.config(state=tk.NORMAL)
-        self.replace_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
+
+        self._reset_ui()
 
     def stop_processing(self):
         if self.running:
@@ -670,15 +794,30 @@ class BatchTextReplacer:
         self.start_operation(replace_mode=True)
 
     def start_processing(self, replace_mode):
+        if not self.replace_rules:
+            messagebox.showinfo(PROMPT_INFO, PROMPT_NO_RULES)
+            return
+
+        try:
+            self._compile_rules()
+        except re.error as e:
+            messagebox.showerror(PROMPT_ERROR, MSG_INVALID_REGEX.format(e))
+            return
+
+        folder = self.folder_path.get()
+        pattern = self.file_filter_pattern.get()
+        recursive = self.recursive_var.get()
+
         self.running = True
-        self._compile_rules()
-        self.find_only_btn.config(state=tk.DISABLED)
-        self.replace_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+        self._set_busy(True)
         self.status_var.set(STATUS_WORKING)
         self.add_message(MSG_START_PROCESS, force=True)
-        
-        threading.Thread(target=self.process_files, args=(replace_mode,), daemon=True).start()
+
+        threading.Thread(
+            target=self.process_files,
+            args=(folder, pattern, recursive, replace_mode),
+            daemon=True
+        ).start()
 
 
 if __name__ == "__main__":
